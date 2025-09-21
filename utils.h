@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/* Constants */
+#define US_PER_SEC (1000000)
+#define NS_PER_US (1000)
+
 /* Stats */
 typedef struct
 {
@@ -41,5 +45,10 @@ int UTILS_SetThreadRealtimePriority(void);
 
 /* Set CPU affinity to single CPU */
 int UTILS_SetThreadAffinity(int cpu_id);
+
+/* Get incremental time counter */
+uint64_t UTILS_GetMonotonicMicros(void);
+
+void dump_hex(const void *data, int len);
 
 #endif

@@ -35,6 +35,7 @@ endif()
 add_executable(sdr_ip_gadget
     main.c
     epoll_loop.c
+    sockets.c
     thread_read.c
     thread_write.c
     utils.c

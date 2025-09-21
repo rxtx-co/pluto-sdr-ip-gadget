@@ -24,21 +24,17 @@
 #include "epoll_loop.h"
 #include "thread_read.h"
 #include "thread_write.h"
+#include "utils.h"
 
 /* Macros */
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define DEBUG_PRINT(...) if (debug) printf("Main: "__VA_ARGS__)
-
-/* Definitions - UDP port numbers */
-#define DIRECT_IP_PORT_CONTROL (30432) // IIOD + 1
-#define DIRECT_IP_PORT_DATA (30433) // IIOD + 2
 
 /* Type definitions */
 typedef struct
 {
 	/* Socket file descriptors */
 	int sock_control;
-	int sock_data;
 
 	/* Eventfds to signal threads */
 	int read_thread_event_fd;
@@ -64,6 +60,8 @@ typedef int (*epoll_event_handler)(state_t *state);
 /* Global variables */
 bool debug;
 
+uint64_t start_time_usec;
+
 /* Private function */
 static int handle_control(state_t *state);
 static bool start_thread(state_t *state, bool tx);
@@ -78,6 +76,8 @@ static volatile sig_atomic_t keep_running = 1;
 /* Public functions */
 int main(int argc, char *argv[])
 {
+	start_time_usec = UTILS_GetMonotonicMicros();
+
 	state_t state;
 	struct sockaddr_in addr;
 
@@ -133,7 +133,7 @@ int main(int argc, char *argv[])
 		/* Unrecognised argument */
 		fprintf(stderr, "Error: Unrecognised argument\n");
 		print_usage(argv[0], stderr);
-		return 1;
+		return -1;
 	}
 
 	/* Register signal handler */
@@ -145,90 +145,24 @@ int main(int argc, char *argv[])
 	if (state.sock_control < 0)
 	{
 		perror("Failed to open control socket");
-		return false;
+		return -1;
 	}
-	else
-	{
-		DEBUG_PRINT("Opened control socket :-)\n");
-	}
-	state.sock_data = socket(AF_INET, SOCK_DGRAM, 0);
-	if (state.sock_data < 0)
-	{
-		perror("Failed to open data socket");
-		return false;
-	}
-	else
-	{
-		DEBUG_PRINT("Opened data socket :-)\n");
-	}
+	DEBUG_PRINT("Opened control socket :-)\n");
 
 	/* Place sockets in non-blocking mode */
 	if (fcntl(state.sock_control, F_SETFL, fcntl(state.sock_control, F_GETFL, 0) | O_NONBLOCK))
 	{
 		perror("Failed to set control socket mode to non-blocking");
-		return 1;
-	}
-	if (fcntl(state.sock_data, F_SETFL, fcntl(state.sock_data, F_GETFL, 0) | O_NONBLOCK))
-	{
-		perror("Failed to set data socket mode to non-blocking");
-		return 1;
+		close(state.sock_control);
+		return -1;
 	}
 
-    // Get the current send buffer size
-    int send_size;
-	socklen_t size_len = sizeof(send_size);
-    if (getsockopt(state.sock_data, SOL_SOCKET, SO_SNDBUF, &send_size, &size_len) == -1)
-	{
-        perror("getsockopt for send buffer size");
-        return 1;
-    }
-
-    // Get the current receive buffer size
-    int recv_size;
-    size_len = sizeof(recv_size);
-    if (getsockopt(state.sock_data, SOL_SOCKET, SO_RCVBUF, &recv_size, &size_len) == -1)
-	{
-        perror("getsockopt for receive buffer size");
-        return 1;
-    }
-
-	// Report current sizes
-    DEBUG_PRINT("Current socket send = %d receive = %d\n", send_size, recv_size);
-
-	// Set the send buffer size
-	send_size = 524288;
-    if (setsockopt(state.sock_data, SOL_SOCKET, SO_SNDBUF, &send_size, sizeof(send_size)) == -1)
-	{
-        perror("setsockopt for send buffer size");
-        return 1;
-    }
-
-	// Set the receive buffer size
-	recv_size = 524288;
-    if (setsockopt(state.sock_data, SOL_SOCKET, SO_RCVBUF, &recv_size, sizeof(send_size)) == -1)
-	{
-        perror("setsockopt for receive buffer size");
-        return 1;
-    }
-
-    // Get the updated send buffer size
-	size_len = sizeof(send_size);
-    if (getsockopt(state.sock_data, SOL_SOCKET, SO_SNDBUF, &send_size, &size_len) == -1)
-	{
-        perror("getsockopt for send buffer size");
-        return 1;
-    }
-
-    // Get the updated receive buffer size
-    size_len = sizeof(recv_size);
-    if (getsockopt(state.sock_data, SOL_SOCKET, SO_RCVBUF, &recv_size, &size_len) == -1)
-	{
-        perror("getsockopt for receive buffer size");
-        return 1;
-    }
-
-	// Report updated sizes
-    DEBUG_PRINT("Updated socket send = %d receive = %d\n", send_size, recv_size);
+	int optval = 1;
+	if (setsockopt(state.sock_control, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) == -1) {
+		perror("setsockopt(SO_REUSEADDR) failed for control socket");
+		close(state.sock_control);
+		return -1;
+	}
 
 	/* Bind sockets */
 	memset(&addr, 0x00, sizeof(addr));
@@ -238,64 +172,44 @@ int main(int argc, char *argv[])
 	if (bind(state.sock_control, (const struct sockaddr *)&addr, sizeof(addr)))
 	{
 		perror("Failed to bind control socket");
-		return 1;
+		close(state.sock_control);
+		return -1;
 	}
-	else
-	{
-		DEBUG_PRINT("Bound control socket :-)\n");
-	}
-	addr.sin_port = htons(DIRECT_IP_PORT_DATA);
-	if (bind(state.sock_data, (const struct sockaddr *)&addr, sizeof(addr)))
-	{
-		perror("Failed to bind data socket");
-		return 1;
-	}
-	else
-	{
-		DEBUG_PRINT("Bound data socket :-)\n");
-	}
+	DEBUG_PRINT("Bound control socket :-)\n");
 
 	/* Prepare eventfds to notify threads to cancel */
 	state.read_thread_event_fd = eventfd(0, 0);
 	if (state.read_thread_event_fd < 0)
 	{
 		perror("Failed to open read eventfd");
-		return 1;
+		return -1;
 	}
-	else
-	{
-		DEBUG_PRINT("Opened read eventfd :-)\n");
-	}
+	DEBUG_PRINT("Opened read eventfd :-)\n");
+
 	state.write_thread_event_fd = eventfd(0, 0);
 	if (state.write_thread_event_fd < 0)
 	{
 		perror("Failed to open write eventfd");
-		return 1;
+		return -1;
 	}
-	else
-	{
-		DEBUG_PRINT("Opened write eventfd :-)\n");
-	}
+	DEBUG_PRINT("Opened write eventfd :-)\n");
+
 
 	/* Prepare read args */
 	state.read_args.quit_event_fd = state.read_thread_event_fd;
-	state.read_args.output_fd = state.sock_data;
 
 	/* Prepare write args */
 	state.write_args.quit_event_fd = state.write_thread_event_fd;
-	state.write_args.input_fd = state.sock_data;
 
 	/* Create epoll instance */
 	int epoll_fd = epoll_create1(0);
 	if (epoll_fd < 0)
 	{
 		perror("Failed to create epoll instance");
-		return 1;
+		return -1;
 	}
-	else
-	{
-		DEBUG_PRINT("Opened epoll :-)\n");
-	}
+	DEBUG_PRINT("Opened epoll :-)\n");
+
 
 	struct epoll_event epoll_event;
 
@@ -306,12 +220,10 @@ int main(int argc, char *argv[])
 	{
 		/* Failed to register control socket with epoll */
 		perror("Failed to register control socket with epoll");
-		return 1;
+		return -1;
 	}
-	else
-	{
-		DEBUG_PRINT("Registered control socket with epoll :-)\n");
-	}
+	DEBUG_PRINT("Registered control socket with epoll :-)\n");
+
 
 	/* Here we go */
 	printf("Ready :-)\n");
@@ -338,7 +250,7 @@ int main(int argc, char *argv[])
 	close(state.read_thread_event_fd);
 	close(state.write_thread_event_fd);
 	close(state.sock_control);
-	close(state.sock_data);
+	//close(state.sock_data);
 
 	/* Goodbye */
 	printf("Bye!\n");
@@ -389,13 +301,24 @@ static int handle_control(state_t *state)
 			stop_thread(state, true);
 
 			/* Prepare args */
-			DEBUG_PRINT("Start TX with chans: %08X, timestamp: %S, buffsize: %zu\n",
+			char addr_str[INET_ADDRSTRLEN];
+			if (inet_ntop(AF_INET, &(addr.sin_addr), addr_str, INET_ADDRSTRLEN) == NULL) {
+				perror("Error converting address to string");
+				addr_str[0] = '\0';
+			}
+			DEBUG_PRINT("Start TX with chans: %08X, timestamp: %S, buffsize: %zu, source: %s:%u\n",
 						cmd.start_tx.enabled_channels,
 						cmd.start_tx.timestamping_enabled ? "enabled" : "disabled",
-						cmd.start_tx.buffer_size);
+						cmd.start_tx.buffer_size_samples,
+						addr_str, ntohs(cmd.start_rx.data_port));
+			state->write_args.addr.sin_family = AF_INET;
+			state->write_args.addr.sin_addr = addr.sin_addr;
+			state->write_args.addr.sin_port = htons(cmd.start_rx.data_port);
 			state->write_args.iio_channels = cmd.start_tx.enabled_channels;
 			state->write_args.timestamping_enabled = cmd.start_tx.timestamping_enabled;
-			state->write_args.iio_buffer_size = cmd.start_tx.buffer_size;
+			state->write_args.transport_tcp = cmd.start_tx.transport_tcp;
+			state->write_args.timestamp_increment = cmd.start_tx.timestamp_increment;
+			state->write_args.buffer_size_samples = cmd.start_tx.buffer_size_samples;
 
 			/* Start thread */
 			start_thread(state, true);
@@ -419,10 +342,10 @@ static int handle_control(state_t *state)
 				perror("Error converting address to string");
 				addr_str[0] = '\0';
 			}
-			DEBUG_PRINT("Start RX with chans: %08X, timestamp: %s, buffsize: %zu, pktsize: %zu, dest: %s:%u\n",
+			DEBUG_PRINT("Start RX with chans: %08X, timestamp: %s, buffer samples: %zu, pktsize: %zu, dest: %s:%u\n",
 						cmd.start_rx.enabled_channels,
 						cmd.start_rx.timestamping_enabled ? "enabled" : "disabled",
-						cmd.start_rx.buffer_size,
+						cmd.start_rx.buffer_size_samples,
 						cmd.start_rx.packet_size,
 						addr_str, ntohs(cmd.start_rx.data_port));
 			state->read_args.addr.sin_family = AF_INET;
@@ -430,7 +353,9 @@ static int handle_control(state_t *state)
 			state->read_args.addr.sin_port = htons(cmd.start_rx.data_port);
 			state->read_args.iio_channels = cmd.start_rx.enabled_channels;
 			state->read_args.timestamping_enabled = cmd.start_rx.timestamping_enabled;
-			state->read_args.iio_buffer_size = cmd.start_rx.buffer_size;
+			state->read_args.timestamp_increment = cmd.start_rx.timestamp_increment;
+			state->read_args.transport_tcp = cmd.start_rx.transport_tcp;
+			state->read_args.buffer_size_samples = cmd.start_rx.buffer_size_samples;
 			state->read_args.udp_packet_size = cmd.start_rx.packet_size;
 
 			/* Start thread */

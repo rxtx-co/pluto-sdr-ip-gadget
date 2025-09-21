@@ -11,12 +11,6 @@
 #include <string.h>
 #include <time.h>
 
-/* Constants */
-#define US_PER_SEC (1000000)
-#define NS_PER_US (1000)
-
-/* Private functions */
-static uint64_t GetMonotonicMicros(void);
 
 /* Public functions */
 void UTILS_ResetTimeStats(UTILS_TimeStats_t *ctx)
@@ -31,13 +25,13 @@ void UTILS_ResetTimeStats(UTILS_TimeStats_t *ctx)
 void UTILS_StartTimeStats(UTILS_TimeStats_t *ctx)
 {
     /* Set last timestamp and flag initialized */
-    ctx->last_time = GetMonotonicMicros();
+    ctx->last_time = UTILS_GetMonotonicMicros();
     ctx->initialized = true;
 }
 
 void UTILS_UpdateTimeStats(UTILS_TimeStats_t *ctx)
 {
-    uint64_t curr_time = GetMonotonicMicros();
+    uint64_t curr_time = UTILS_GetMonotonicMicros();
 
     if (ctx->initialized)
     {
@@ -102,8 +96,7 @@ int UTILS_SetThreadAffinity(int cpu_id)
     return rc;
 }
 
-/* Private functions */
-static uint64_t GetMonotonicMicros(void)
+uint64_t UTILS_GetMonotonicMicros(void)
 {
     struct timespec tmp_time;
 
@@ -115,4 +108,13 @@ static uint64_t GetMonotonicMicros(void)
 
     /* Convert seconds + nanoseconds to us */
     return (((uint64_t)tmp_time.tv_sec * US_PER_SEC) + ((uint64_t)tmp_time.tv_nsec / NS_PER_US));
+}
+
+
+void dump_hex(const void *data, int len) {
+    const unsigned char *p = (const unsigned char *)data;
+    for (size_t i = 0; i < len; ++i) {
+        fprintf(stderr, "%02X%s", p[i], (i + 1 == len) ? "" : " ");
+    }
+    fprintf(stderr, "\n");
 }

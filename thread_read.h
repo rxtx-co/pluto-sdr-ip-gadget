@@ -13,9 +13,6 @@ typedef struct
 	/* Eventfd used to signal thread to quit */
 	int quit_event_fd;
 
-	/* UDP socket to write to */
-	int output_fd;
-
 	/* Client address */
 	struct sockaddr_in addr;
 
@@ -25,8 +22,14 @@ typedef struct
 	/* Timestamping enabled */
 	bool timestamping_enabled;
 
+	/* Timestamp increment per buffer adjusted to timestamp clock rate */
+	uint32_t timestamp_increment;
+
+	/* Data transport tcp/udp */
+	bool transport_tcp;
+
 	/* Sample buffer size (in samples) */
-	size_t iio_buffer_size;
+	size_t buffer_size_samples;
 
 	/* UDP packet size (in bytes) */
 	size_t udp_packet_size;
