@@ -52,6 +52,9 @@ typedef struct
 	/* Keep running */
 	bool keep_running;
 
+	/* epoll handler */
+	int epoll_fd;
+
 	/* socket to write to */
 	int output_fd;
 
@@ -88,6 +91,7 @@ typedef struct
 	uint64_t seqno;
 
 	#if GENERATE_STATS
+	int stats_timerfd;
 	uint64_t stats_timer;
 
 	uint64_t bytes_sent;
@@ -119,6 +123,7 @@ extern uint64_t start_time_usec;
 static int handle_eventfd_thread(state_t *state);
 static int handle_iio_buffer(state_t *state);
 #if GENERATE_STATS
+static int handle_stats_timer(state_t *state);
 static int dump_stats(state_t *state);
 #endif
 
@@ -154,8 +159,8 @@ void *THREAD_READ_Entrypoint(void *args)
 	}
 
 	/* Create epoll instance */
-	int epoll_fd = epoll_create1(0);
-	if (epoll_fd < 0)
+	state.epoll_fd = epoll_create1(0);
+	if (state.epoll_fd < 0)
 	{
 		perror("Failed to create epoll instance");
 		return NULL;
@@ -170,7 +175,7 @@ void *THREAD_READ_Entrypoint(void *args)
 	/* Register thread quit eventfd with epoll */
 	epoll_event.events = EPOLLIN;
 	epoll_event.data.ptr = handle_eventfd_thread;
-	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, thread_args->quit_event_fd, &epoll_event) < 0)
+	if (epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, thread_args->quit_event_fd, &epoll_event) < 0)
 	{
 		perror("Failed to register thread quit eventfd with epoll");
 		return NULL;
@@ -244,7 +249,7 @@ void *THREAD_READ_Entrypoint(void *args)
 	/* Register buffer with epoll */
 	epoll_event.events = EPOLLIN;
 	epoll_event.data.ptr = handle_iio_buffer;
-	if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, iio_buffer_get_poll_fd(state.iio_rx_buffer), &epoll_event) < 0)
+	if (epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, iio_buffer_get_poll_fd(state.iio_rx_buffer), &epoll_event) < 0)
 	{
 		/* Failed to register IIO buffer with epoll */
 		perror("Failed to register IIO buffer with epoll");
@@ -287,6 +292,38 @@ void *THREAD_READ_Entrypoint(void *args)
 	DEBUG_PRINT("Timestamp increment: %u\n", state.thread_args->timestamp_increment);
 
 	#if GENERATE_STATS
+	/* Create stats reporting timer */
+	state.stats_timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
+	if (state.stats_timerfd < 0)
+	{
+		perror("Failed to open timerfd");
+		return NULL;
+	}
+	DEBUG_PRINT("Opened timerfd :-)\n");
+
+	struct itimerspec timer_period =
+	{
+		.it_value = { .tv_sec = STATS_PERIOD_SECS, .tv_nsec = 0 },
+		.it_interval = { .tv_sec = STATS_PERIOD_SECS, .tv_nsec = 0 }
+	};
+	if (timerfd_settime(state.stats_timerfd, 0, &timer_period, NULL) < 0)
+	{
+		perror("Failed to set timerfd");
+		return NULL;
+	}
+	DEBUG_PRINT("Set timerfd :-)\n");
+
+	/* Register timer with epoll */
+	epoll_event.events = EPOLLIN;
+	epoll_event.data.ptr = handle_stats_timer;
+	if (epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.stats_timerfd, &epoll_event) < 0)
+	{
+		/* Failed to register timer with epoll */
+		perror("Failed to register timer eventfd with epoll");
+		return NULL;
+	}
+	DEBUG_PRINT("Registered timer with with epoll :-)\n");
+
 	/* Init timer */
 	UTILS_ResetTimeStats(&state.read_period);
 	UTILS_ResetTimeStats(&state.read_dur);
@@ -298,7 +335,7 @@ void *THREAD_READ_Entrypoint(void *args)
 	state.keep_running = true;
 	while (state.keep_running)
 	{
-		if (EPOLL_LOOP_Run(epoll_fd, 30000, &state) < 0)
+		if (EPOLL_LOOP_Run(state.epoll_fd, 30000, &state) < 0)
 		{
 			/* Epoll failed...bail */
 			break;
@@ -306,14 +343,14 @@ void *THREAD_READ_Entrypoint(void *args)
 	}
 	DEBUG_PRINT("Exit read loop..\n");
 
+	/* Close / destroy everything */
 	#if GENERATE_STATS
+	close(state.stats_timerfd);
 	dump_stats(&state);
 	#endif
-
-	/* Close / destroy everything */
 	iio_buffer_destroy(state.iio_rx_buffer);
 	iio_context_destroy(iio_ctx);
-	close(epoll_fd);
+	close(state.epoll_fd);
 	close(state.output_fd);
 
 	/* Exit */
@@ -548,6 +585,11 @@ static int tcp_send(state_t *state, uint8_t *payload)
 
 
 #if GENERATE_STATS
+static int handle_stats_timer(state_t *state)
+{
+	return dump_stats(state);
+}
+
 static int dump_stats(state_t *state)
 {
 	const uint64_t now_usec = UTILS_GetMonotonicMicros();

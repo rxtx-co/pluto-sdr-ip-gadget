@@ -49,6 +49,9 @@ typedef struct
 	/* Thread args */
 	THREAD_WRITE_Args_t *thread_args;
 
+	/* Keep running */
+	bool keep_running;
+
 	/* epoll handler */
 	int epoll_fd;
 
@@ -57,9 +60,6 @@ typedef struct
 
 	/* iio_buffer file descriptor for epoll */
 	int iio_buf_fd;
-
-	/* Keep running */
-	bool keep_running;
 
 	/* IIO sample buffer */
 	struct iio_buffer *iio_tx_buffer;
@@ -88,6 +88,7 @@ typedef struct
 	} udp;
 
 	#if GENERATE_STATS
+	int stats_timerfd;
 	uint64_t stats_timer;
 
 	uint64_t socket_recv;
@@ -128,6 +129,7 @@ static int handle_eventfd_thread(state_t *state);
 static int handle_socket(state_t *state);
 static int handle_iio_push(state_t *state);
 #if GENERATE_STATS
+static int handle_stats_timer(state_t *state);
 static int dump_stats(state_t *state);
 #endif
 
@@ -301,6 +303,38 @@ void *THREAD_WRITE_Entrypoint(void *args)
 	}
 
 	#if GENERATE_STATS
+	/* Create stats reporting timer */
+	state.stats_timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
+	if (state.stats_timerfd < 0)
+	{
+		perror("Failed to open timerfd");
+		return NULL;
+	}
+	DEBUG_PRINT("Opened timerfd :-)\n");
+
+	struct itimerspec timer_period =
+	{
+		.it_value = { .tv_sec = STATS_PERIOD_SECS, .tv_nsec = 0 },
+		.it_interval = { .tv_sec = STATS_PERIOD_SECS, .tv_nsec = 0 }
+	};
+	if (timerfd_settime(state.stats_timerfd, 0, &timer_period, NULL) < 0)
+	{
+		perror("Failed to set timerfd");
+		return NULL;
+	}
+	DEBUG_PRINT("Set timerfd :-)\n");
+
+	/* Register timer with epoll */
+	epoll_event.events = EPOLLIN;
+	epoll_event.data.ptr = handle_stats_timer;
+	if (epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.stats_timerfd, &epoll_event) < 0)
+	{
+		/* Failed to register timer with epoll */
+		perror("Failed to register timer eventfd with epoll");
+		return NULL;
+	}
+	DEBUG_PRINT("Registered timer with with epoll :-)\n");
+
 	/* Init timers */
 	UTILS_ResetTimeStats(&state.write_period);
 	UTILS_ResetTimeStats(&state.write_dur);
@@ -321,6 +355,10 @@ void *THREAD_WRITE_Entrypoint(void *args)
 	DEBUG_PRINT("Exit write loop..\n");
 
 	/* Close / destroy everything */
+	#if GENERATE_STATS
+	close(state.stats_timerfd);
+	dump_stats(&state);
+	#endif
 	close(state.input_fd);
 	close(state.epoll_fd);
 	iio_buffer_destroy(state.iio_tx_buffer);
@@ -769,6 +807,11 @@ static void epoll_enable_iio(state_t *state)
 
 
 #if GENERATE_STATS
+static int handle_stats_timer(state_t *state)
+{
+	return dump_stats(state);
+}
+
 static int dump_stats(state_t *state)
 {
 	const uint64_t now_usec = UTILS_GetMonotonicMicros();
