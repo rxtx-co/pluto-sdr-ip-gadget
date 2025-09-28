@@ -433,10 +433,6 @@ static int handle_iio_buffer(state_t *state)
 	state->seqno += state->thread_args->timestamp_increment;
 
 	#if GENERATE_STATS
-	state->bytes_sent += bytes_to_send;
-	#endif
-
-	#if GENERATE_STATS
 	dump_stats(state);
 	#endif
 
