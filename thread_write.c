@@ -28,6 +28,7 @@
 #include "epoll_loop.h"
 #include "utils.h"
 #include "sockets.h"
+#include "crc8_0x07_56b.h"
 
 /* Set the following to periodically report statistics */
 #ifndef GENERATE_STATS
@@ -42,6 +43,8 @@
 /* Macros */
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define DEBUG_PRINT(...) if (debug) printf("Write: "__VA_ARGS__)
+
+#define MASK_56b(x) ((x) & 0x00ffffffffffffff)
 
 /* Type definitions */
 typedef struct
@@ -88,7 +91,6 @@ typedef struct
 	} udp;
 
 	#if GENERATE_STATS
-	int stats_timerfd;
 	uint64_t stats_timer;
 
 	uint64_t socket_recv;
@@ -129,7 +131,6 @@ static int handle_eventfd_thread(state_t *state);
 static int handle_socket(state_t *state);
 static int handle_iio_push(state_t *state);
 #if GENERATE_STATS
-static int handle_stats_timer(state_t *state);
 static int dump_stats(state_t *state);
 #endif
 
@@ -303,38 +304,6 @@ void *THREAD_WRITE_Entrypoint(void *args)
 	}
 
 	#if GENERATE_STATS
-	/* Create stats reporting timer */
-	state.stats_timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
-	if (state.stats_timerfd < 0)
-	{
-		perror("Failed to open timerfd");
-		return NULL;
-	}
-	DEBUG_PRINT("Opened timerfd :-)\n");
-
-	struct itimerspec timer_period =
-	{
-		.it_value = { .tv_sec = STATS_PERIOD_SECS, .tv_nsec = 0 },
-		.it_interval = { .tv_sec = STATS_PERIOD_SECS, .tv_nsec = 0 }
-	};
-	if (timerfd_settime(state.stats_timerfd, 0, &timer_period, NULL) < 0)
-	{
-		perror("Failed to set timerfd");
-		return NULL;
-	}
-	DEBUG_PRINT("Set timerfd :-)\n");
-
-	/* Register timer with epoll */
-	epoll_event.events = EPOLLIN;
-	epoll_event.data.ptr = handle_stats_timer;
-	if (epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.stats_timerfd, &epoll_event) < 0)
-	{
-		/* Failed to register timer with epoll */
-		perror("Failed to register timer eventfd with epoll");
-		return NULL;
-	}
-	DEBUG_PRINT("Registered timer with with epoll :-)\n");
-
 	/* Init timers */
 	UTILS_ResetTimeStats(&state.write_period);
 	UTILS_ResetTimeStats(&state.write_dur);
@@ -356,7 +325,6 @@ void *THREAD_WRITE_Entrypoint(void *args)
 
 	/* Close / destroy everything */
 	#if GENERATE_STATS
-	close(state.stats_timerfd);
 	dump_stats(&state);
 	#endif
 	close(state.input_fd);
@@ -433,7 +401,10 @@ static int handle_socket(state_t *state)
 
 	if (prepend_timestamp)
 	{
-		*((uint64_t*)buffer) = pkt_hdr.seqno;
+		uint64_t seqno = MASK_56b(pkt_hdr.seqno);
+		uint8_t crc8 = crc8_0x07_56b(0x00, seqno);
+
+		*((uint64_t*)buffer) = ((uint64_t)(crc8) << 56) | seqno;
 		state->iio_buffer_used += sizeof(uint64_t);
 	}
 
@@ -445,10 +416,6 @@ static int handle_socket(state_t *state)
 
 		epoll_disable_socket(state);
 		epoll_enable_iio(state);
-
-		//usleep(16400);
-		//state->seqno += state->thread_args->timestamp_increment;
-		//state->iio_buffer_used = 0;
 	}
 
 	#if GENERATE_STATS
@@ -545,23 +512,24 @@ static int update_state(state_t *state, data_ip_hdr_t *hdr)
 		}
 
 		/* check seqno */
-		if (hdr->seqno < state->seqno) {
-			#if GENERATE_STATS
-			state->time_wraps++;
-			#endif
-			DEBUG_PRINT("time wraps: last seqno=%" PRIu64 " hdr.seqno=%" PRIu64 " delta=%" PRId64 "\n",
-				state->seqno,
-				hdr->seqno,
-				(state->seqno - hdr->seqno));
-		} else
-		if (hdr->seqno != state->seqno) {
-			#if GENERATE_STATS
-			state->time_gaps++;
-			#endif
-			DEBUG_PRINT("time gap: last seqno=%" PRIu64 " hdr.seqno=%" PRIu64 " delta=%" PRId64 "\n",
-				state->seqno,
-				hdr->seqno,
-				(hdr->seqno - state->seqno));
+		if (abs(hdr->seqno - state->seqno) > 1) {
+			if (hdr->seqno < state->seqno) {
+				#if GENERATE_STATS
+				state->time_wraps++;
+				#endif
+				DEBUG_PRINT("time wraps: last seqno=%" PRIu64 " hdr.seqno=%" PRIu64 " delta=%" PRId64 "\n",
+					state->seqno,
+					hdr->seqno,
+					(state->seqno - hdr->seqno));
+			} else {
+				#if GENERATE_STATS
+				state->time_gaps++;
+				#endif
+				DEBUG_PRINT("time gap: last seqno=%" PRIu64 " hdr.seqno=%" PRIu64 " delta=%" PRId64 "\n",
+					state->seqno,
+					hdr->seqno,
+					(hdr->seqno - state->seqno));
+			}
 		}
 
 		/* First block: update the state */

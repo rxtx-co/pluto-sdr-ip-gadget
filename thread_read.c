@@ -28,6 +28,7 @@
 #include "epoll_loop.h"
 #include "utils.h"
 #include "sockets.h"
+#include "crc8_0x07_56b.h"
 
 /* Set the following to periodically report statistics */
 #ifndef GENERATE_STATS
@@ -42,6 +43,8 @@
 /* Macros */
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #define DEBUG_PRINT(...) if (debug) printf("Read: "__VA_ARGS__)
+
+#define MASK_56b(x) ((x) & 0x00ffffffffffffff)
 
 /* Type definitions */
 typedef struct
@@ -91,7 +94,6 @@ typedef struct
 	uint64_t seqno;
 
 	#if GENERATE_STATS
-	int stats_timerfd;
 	uint64_t stats_timer;
 
 	uint64_t bytes_sent;
@@ -99,6 +101,9 @@ typedef struct
 
 	/* Overflow count */
 	uint32_t overflows;
+
+	/* Timestamp CRC8 is incorrect */
+	uint32_t timestamp_bad_crc8;
 
 	/* Non sequential timestamp */
 	uint32_t timestamp_misaligned;
@@ -123,7 +128,6 @@ extern uint64_t start_time_usec;
 static int handle_eventfd_thread(state_t *state);
 static int handle_iio_buffer(state_t *state);
 #if GENERATE_STATS
-static int handle_stats_timer(state_t *state);
 static int dump_stats(state_t *state);
 #endif
 
@@ -292,38 +296,6 @@ void *THREAD_READ_Entrypoint(void *args)
 	DEBUG_PRINT("Timestamp increment: %u\n", state.thread_args->timestamp_increment);
 
 	#if GENERATE_STATS
-	/* Create stats reporting timer */
-	state.stats_timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
-	if (state.stats_timerfd < 0)
-	{
-		perror("Failed to open timerfd");
-		return NULL;
-	}
-	DEBUG_PRINT("Opened timerfd :-)\n");
-
-	struct itimerspec timer_period =
-	{
-		.it_value = { .tv_sec = STATS_PERIOD_SECS, .tv_nsec = 0 },
-		.it_interval = { .tv_sec = STATS_PERIOD_SECS, .tv_nsec = 0 }
-	};
-	if (timerfd_settime(state.stats_timerfd, 0, &timer_period, NULL) < 0)
-	{
-		perror("Failed to set timerfd");
-		return NULL;
-	}
-	DEBUG_PRINT("Set timerfd :-)\n");
-
-	/* Register timer with epoll */
-	epoll_event.events = EPOLLIN;
-	epoll_event.data.ptr = handle_stats_timer;
-	if (epoll_ctl(state.epoll_fd, EPOLL_CTL_ADD, state.stats_timerfd, &epoll_event) < 0)
-	{
-		/* Failed to register timer with epoll */
-		perror("Failed to register timer eventfd with epoll");
-		return NULL;
-	}
-	DEBUG_PRINT("Registered timer with with epoll :-)\n");
-
 	/* Init timer */
 	UTILS_ResetTimeStats(&state.read_period);
 	UTILS_ResetTimeStats(&state.read_dur);
@@ -345,7 +317,6 @@ void *THREAD_READ_Entrypoint(void *args)
 
 	/* Close / destroy everything */
 	#if GENERATE_STATS
-	close(state.stats_timerfd);
 	dump_stats(&state);
 	#endif
 	iio_buffer_destroy(state.iio_rx_buffer);
@@ -371,6 +342,8 @@ static int handle_eventfd_thread(state_t *state)
 
 static int handle_iio_buffer(state_t *state)
 {
+	const bool timestamping_en = state->thread_args->timestamping_enabled;
+
 	#if GENERATE_STATS
 	/* Capture read period */
 	UTILS_UpdateTimeStats(&state->read_period);
@@ -401,13 +374,27 @@ static int handle_iio_buffer(state_t *state)
 	uint8_t *buffer = iio_buffer_start(state->iio_rx_buffer);
 	size_t bytes_to_send = state->iio_buffer_size;
 
-	if (state->thread_args->timestamping_enabled)
+	if (timestamping_en)
 	{
 		/* Update sequence number from IIO buffer, advance pointer, decrement size */
-		uint64_t seqno = *((uint64_t*)buffer);
+		uint64_t seqno_with_crc = *((uint64_t*)buffer);
 		buffer += sizeof(uint64_t);
 		bytes_to_send -= sizeof(uint64_t);
 
+		uint64_t seqno = MASK_56b(seqno_with_crc);
+
+		/* CRC8 calculation consumes too much CPU */
+		uint8_t crc8_recv = (seqno_with_crc >> 56) & 0xff;
+		uint8_t crc8_calc = crc8_0x07_56b(0x00, seqno);
+		if (crc8_recv != crc8_calc) {
+			DEBUG_PRINT("Timestamp CRC8 error (misaligment ?): crc8_calc=%u crc8_recv=%u\n",
+					crc8_calc, crc8_recv);
+			#if GENERATE_STATS
+			state->timestamp_bad_crc8 += 1;
+			#endif
+			// drop the packet
+			return 0;
+		} else
 		if (abs(seqno - state->seqno) > 1) {
 			DEBUG_PRINT("Timestamp misaligned: expected seqno=%" PRIu64 " buffer seqno %" PRIu64 " delta %" PRId64 "\n",
 					state->seqno, seqno,
@@ -416,6 +403,7 @@ static int handle_iio_buffer(state_t *state)
 			state->timestamp_misaligned += 1;
 			#endif
 		}
+
 		state->seqno = seqno;
 	}
 
@@ -581,11 +569,6 @@ static int tcp_send(state_t *state, uint8_t *payload)
 
 
 #if GENERATE_STATS
-static int handle_stats_timer(state_t *state)
-{
-	return dump_stats(state);
-}
-
 static int dump_stats(state_t *state)
 {
 	const uint64_t now_usec = UTILS_GetMonotonicMicros();
@@ -621,6 +604,10 @@ static int dump_stats(state_t *state)
 		printf("\toverflows=%"PRIu32"\n", state->overflows);
 	}
 
+	if (state->timestamp_bad_crc8) {
+		printf("\ttimestamp_bad_crc8=%u\n", state->timestamp_bad_crc8);
+	}
+
 	if (state->timestamp_misaligned) {
 		printf("\ttimestamp_misaligned=%u\n", state->timestamp_misaligned);
 	}
@@ -633,6 +620,7 @@ done:
 	state->stats_timer = now_usec;
 	state->bytes_sent = 0;
 	state->iio_calls = 0;
+	state->timestamp_bad_crc8 = 0;
 	state->timestamp_misaligned = 0;
 	state->overflows = 0;
 
